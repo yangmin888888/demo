@@ -453,7 +453,7 @@ install_audit_listeners()   # 为 Base.registry.mappers 中每个模型注册三
 
 | 事件 | 记录条数 | `field_name` | `old_value` | `new_value` |
 | --- | --- | --- | --- | --- |
-| `before_insert` | 1 | `"*"` | `null` | 全部非空字段快照 |
+| `after_insert` | 1 | `"*"` | `null` | 全部非空字段快照 |
 | `before_update` | **每个变化的字段 1 条** | 字段名 | 旧值 | 新值 |
 | `before_delete` | 1 | `"*"` | 全部非空字段快照 | `null` |
 
@@ -463,16 +463,18 @@ install_audit_listeners()   # 为 Base.registry.mappers 中每个模型注册三
 - `IGNORED_FIELDS = {"id", "created_at", "updated_at"}` 排除元数据噪音。
 - `REDACTED_FIELDS = {"hashed_password"}` 敏感字段脱敏，值记为 `***`，但**保留该条变更记录**（能看出「谁在何时改过密码」，但看不到哈希本身）。对 insert / delete 的整行快照同样生效。
 - `EXCLUDED_TABLES = {"audit_logs"}` 审计表自身不参与审计（否则会无限递归）。
-- 写入用 `connection.execute(AuditLog.__table__.insert()...)` 走**同一条连接的原始 SQL**，不经过 ORM，因此不会再次触发事件。
+- 写入用 `connection.execute(AuditLog.__table__.insert()...)` 走**同一条连接的原始 SQL**，不经过 ORM，因此不会再次触发事件；与业务写入同属一个事务，业务回滚时审计行一并回滚。
 - 序列化：datetime/date → ISO 8601；bytes → decode；Base 实例 → str；其余原样。
 
 `FIELD_LABELS` 是两级字典（表名 → 字段名 → 中文），后端通过 `field_label()` 翻译，CSV 导出用；页面上用的是 `AuditLogs.vue` 里另一份硬编码副本，**两处需同步维护**。
+
+**为什么 insert 挂在 `after_insert` 而不是 `before_insert`**：自增主键要等 INSERT 语句发出并取回 `lastrowid` / `RETURNING` 之后才会回填到 `target` 上。`before_insert` 阶段 `target.id` 恒为 `None`，会导致所有 insert 审计记录的 `record_id` 都是 `null`，无法按记录 ID 筛选创建轨迹，复合索引 `ix_audit_table_record` 也随之失效。`after_insert` 触发时主键已就绪。
 
 **操作人如何传递**（`app/core/audit_context.py`）：把 `(user_id, username)` 绑定到 `Session.info`，而不是用 `contextvars` —— 因为 FastAPI 的同步依赖和同步路由函数运行在线程池的不同线程，`ContextVar` 不跨线程传播。可行的前提是 `get_current_user` 与路由函数依赖的是**同一个** `get_db` 生成器，FastAPI 的依赖缓存保证只 yield 一次，因此拿到同一个 Session 实例。
 
 **审计表只读**是约定而非数据库强制：模型注释声称「数据库层面禁止一切对该表的写操作」，但代码中并没有注册 `before_update` / `before_delete` 监听器去阻止写，只是**不提供**任何修改/删除接口。直接操作数据库仍可篡改审计记录。
 
-> ⚠️ `before_insert` 触发时 SQLAlchemy 尚未回填自增主键，因此 **insert 类审计记录的 `record_id` 恒为 `null`**，无法用「记录ID」筛出某条记录的创建轨迹（update / delete 不受影响）。修复需把事件改挂到 `after_insert` 并从 `context.inserted_primary_key` 取主键。
+> ⚠️ 审计基于 ORM 事件，因此 **`session.execute(insert(User.__table__), ...)` 这类 Core 层批量插入不会产生审计记录**。走 ORM（`session.add()` / 业务接口）是全覆盖的。
 
 ### Session 管理
 
@@ -555,22 +557,19 @@ Pinia store（`src/stores/user.js`），localStorage 持久化两个 key：
 
 按影响程度排序。
 
-### 需要修复
-
-1. **insert 类审计记录丢失 `record_id`** —— `audit_service._on_insert` 挂在 `before_insert`，此时 SQLAlchemy 尚未回填自增主键，`getattr(target, "id", None)` 恒为 `None`，导致**所有 insert 审计记录的 `record_id` 都是 `null`**。影响：无法用「记录ID」筛出某条记录的创建轨迹，复合索引 `ix_audit_table_record` 对 insert 场景失效。修复方式：把事件改挂到 `after_insert`，从 `context.inserted_primary_key` 取主键。update / delete 不受影响。
-
 ### 健壮性
 
-2. **无 404 兜底路由** —— 访问未知路径白屏。
-3. **FastAPI 422 校验错误被压成「请求失败」** —— 422 的 `detail` 是数组而非字符串，`request.js` 的三元判断走不进去，字段级校验信息全部丢失。应解析数组首条并回填到 `el-form`。
-4. **只处理 401，不处理 403** —— 权限不足时用户只看到一句 toast，没有引导。
-5. **导出被截断时前端无感知** —— 后端超 `limit` 会截断并打 WARNING，但响应头不含「已截断」标记，前端照常提示「导出成功」。可在响应头加 `X-Export-Truncated` 让前端提示用户收窄条件。
-6. **页面只有 `try/finally` 没有 `catch`** —— 依赖全局拦截器提示，但会产生未捕获的 Promise rejection。
-7. **`ElMessageBox.confirm` 取消产生的 rejection 未捕获** —— `AdminLayout.vue`、`UserList.vue` 会打控制台警告。
-8. **`router.options.routes.find(...).children` 未用可选链** —— `AdminLayout.vue`，路由结构调整时会崩。
-9. **登录态刷新后不校验 token 有效性** —— 直接读 localStorage，过期 token 会显示陈旧用户信息直到下一次 API 调用。
-10. **登出不通知后端** —— 没有 token 失效机制，JWT 在过期前始终有效。
-11. **`FIELD_LABELS` 双份维护** —— 后端 `audit_service.py` 与前端 `AuditLogs.vue` 各有一份字段名中文映射，改一处忘另一处就会出现页面与 CSV 不一致。建议由后端提供字典接口供前端拉取。
+1. **无 404 兜底路由** —— 访问未知路径白屏。
+2. **FastAPI 422 校验错误被压成「请求失败」** —— 422 的 `detail` 是数组而非字符串，`request.js` 的三元判断走不进去，字段级校验信息全部丢失。应解析数组首条并回填到 `el-form`。
+3. **只处理 401，不处理 403** —— 权限不足时用户只看到一句 toast，没有引导。
+4. **导出被截断时前端无感知** —— 后端超 `limit` 会截断并打 WARNING，但响应头不含「已截断」标记，前端照常提示「导出成功」。可在响应头加 `X-Export-Truncated` 让前端提示用户收窄条件。
+5. **页面只有 `try/finally` 没有 `catch`** —— 依赖全局拦截器提示，但会产生未捕获的 Promise rejection。
+6. **`ElMessageBox.confirm` 取消产生的 rejection 未捕获** —— `AdminLayout.vue`、`UserList.vue` 会打控制台警告。
+7. **`router.options.routes.find(...).children` 未用可选链** —— `AdminLayout.vue`，路由结构调整时会崩。
+8. **登录态刷新后不校验 token 有效性** —— 直接读 localStorage，过期 token 会显示陈旧用户信息直到下一次 API 调用。
+9. **登出不通知后端** —— 没有 token 失效机制，JWT 在过期前始终有效。
+10. **`FIELD_LABELS` 双份维护** —— 后端 `audit_service.py` 与前端 `AuditLogs.vue` 各有一份字段名中文映射，改一处忘另一处就会出现页面与 CSV 不一致。建议由后端提供字典接口供前端拉取。
+11. **存量数据 `record_id` 为 null** —— 修复前写入的 insert 审计记录无法追溯到具体记录。需要时可写一次性脚本回填（按 `new_value` 中的 `username` 关联 `users.id`）。
 
 ### 架构
 
@@ -596,8 +595,13 @@ Pinia store（`src/stores/user.js`），localStorage 持久化两个 key：
 | 401 整页跳转 + 丢失 Pinia 状态 | `request.js` 改为 `setUnauthorizedHandler()` 注入模式，`main.js` 调 `logout()` 后 `router.push` |
 | 改密码把 bcrypt 哈希写进审计表 | 新增 `REDACTED_FIELDS` / `REDACTED_PLACEHOLDER`，insert / update / delete 三条路径均脱敏为 `***` |
 | `init_db` 日志打印明文密码 | 改为只打印用户名并提示尽快改密 |
+| insert 审计记录 `record_id` 恒为 null | 事件从 `before_insert` 改挂 `after_insert`，主键回填后可正常记录 |
 
-验证方式：后端 30 项断言（`TestClient` 跑通建号 / 改密 / 删除 / 权限 / CSV 内容 / 上限 / 全表哈希泄漏扫描），前端 20 项断言（对真实源码打包后跑 `request.js` 拦截器与 Pinia store 行为）。
+验证方式：
+
+- 后端 32 项断言（建号 / 改密 / 删除 / 权限 / CSV 内容 / 导出上限 / 全表哈希泄漏扫描）
+- `after_insert` 专项 15 项（主键回填、按 `record_id` 筛选、复合索引命中 `EXPLAIN`、update/delete 未回归、事务回滚无残留、Core 批量插入边界、全表无 null）
+- 前端 20 项断言（对真实源码打包后跑 `request.js` 拦截器与 Pinia store 行为）
 
 ---
 

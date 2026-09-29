@@ -88,6 +88,9 @@ def _emit(target, connection, operation_id: str, table: str, record_id, action: 
 def _on_insert(mapper: Mapper, connection, target) -> None:
     if target.__tablename__ in EXCLUDED_TABLES:
         return
+    # 必须挂在 after_insert 而非 before_insert：自增主键要等 INSERT 发出并取回
+    # lastrowid / RETURNING 之后才会回填到 target 上，before_insert 阶段取不到，
+    # 会让审计记录的 record_id 恒为 null
     _emit(
         target,
         connection,
@@ -144,7 +147,7 @@ def install_audit_listeners() -> None:
     for mapper in Base.registry.mappers:
         if mapper.class_.__tablename__ in EXCLUDED_TABLES:
             continue
-        event.listen(mapper, "before_insert", _on_insert)
+        event.listen(mapper, "after_insert", _on_insert)
         event.listen(mapper, "before_update", _on_update)
         event.listen(mapper, "before_delete", _on_delete)
 
