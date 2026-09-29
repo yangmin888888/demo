@@ -50,20 +50,20 @@
       <el-table-column label="修改字段" width="130">
         <template #default="{ row }">
           <el-tag v-if="row.field_name === '*'" type="info" size="small">{{ row.action === 'delete' ? '整行(删除)' : '整行(新增)' }}</el-tag>
-          <template v-else>{{ FIELD_LABELS[row.table_name]?.[row.field_name] || row.field_name }}</template>
+          <template v-else>{{ fieldLabel(row.table_name, row.field_name) }}</template>
         </template>
       </el-table-column>
       <el-table-column label="修改前" min-width="200">
         <template #default="{ row }">
-          <el-tooltip :content="fmtValue(row.old_value)" placement="top" :show-after="300">
-            <div class="cell-val">{{ fmtValue(row.old_value) }}</div>
+          <el-tooltip :content="fmtValue(row.old_value, row.table_name)" placement="top" :show-after="300">
+            <div class="cell-val">{{ fmtValue(row.old_value, row.table_name) }}</div>
           </el-tooltip>
         </template>
       </el-table-column>
       <el-table-column label="修改后" min-width="200">
         <template #default="{ row }">
-          <el-tooltip :content="fmtValue(row.new_value)" placement="top" :show-after="300">
-            <div class="cell-val">{{ fmtValue(row.new_value) }}</div>
+          <el-tooltip :content="fmtValue(row.new_value, row.table_name)" placement="top" :show-after="300">
+            <div class="cell-val">{{ fmtValue(row.new_value, row.table_name) }}</div>
           </el-tooltip>
         </template>
       </el-table-column>
@@ -88,21 +88,15 @@
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Search, Refresh, Download } from '@element-plus/icons-vue'
-import { getAuditTables, getAuditLogs, exportAuditLogs } from '@/api/audit'
+import { getAuditTables, getAuditLogs, getAuditLabels, exportAuditLogs } from '@/api/audit'
 
-const ACTION_LABELS = { insert: '新增', update: '修改', delete: '删除' }
+// 兜底字典：接口未返回前先用英文原文占位，避免模板访问 undefined
+const ACTION_LABELS = ref({ insert: '新增', update: '修改', delete: '删除' })
 const ACTION_TAG = { insert: 'success', update: 'warning', delete: 'danger' }
-const TABLE_LABELS = { users: '用户' }
-const FIELD_LABELS = {
-  users: {
-    username: '用户名',
-    email: '邮箱',
-    nickname: '昵称',
-    hashed_password: '登录密码',
-    is_active: '启用状态',
-    is_superuser: '管理员',
-  },
-}
+const TABLE_LABELS = ref({})
+const FIELD_LABELS = ref({})
+
+const fieldLabel = (table, field) => FIELD_LABELS.value[table]?.[field] || field
 
 const loading = ref(false)
 const exporting = ref(false)
@@ -123,12 +117,13 @@ const emptyFilters = () => ({
 const filters = reactive(emptyFilters())
 const range = ref(null)
 
-const fmtValue = (value) => {
+/** tableName 必须取行自身的 table_name，不能用筛选条件——否则未筛选时拿不到字典 */
+const fmtValue = (value, tableName) => {
   if (value === null || value === undefined || value === '') return '-'
   if (typeof value === 'object') {
     return Object.entries(value)
       .filter(([k, v]) => v !== '' && v !== null && v !== undefined)
-      .map(([k, v]) => `${FIELD_LABELS[filters.table_name]?.[k] || k}: ${String(v)}`)
+      .map(([k, v]) => `${fieldLabel(tableName, k)}: ${String(v)}`)
       .join('\n')
   }
   return String(value)
@@ -151,6 +146,8 @@ const load = async () => {
     const data = await getAuditLogs(buildParams())
     list.value = data.items
     total.value = data.total
+  } catch {
+    // 提示已由全局拦截器统一给出
   } finally {
     loading.value = false
   }
@@ -175,21 +172,41 @@ const onSizeChange = () => {
 const onExport = async () => {
   exporting.value = true
   try {
-    const blob = await exportAuditLogs(buildParams())
-    const url = URL.createObjectURL(blob)
+    const { data, headers } = await exportAuditLogs(buildParams())
+    const url = URL.createObjectURL(data)
     const link = document.createElement('a')
     link.href = url
     link.download = `audit_logs_${new Date().toISOString().slice(0, 19).replace(/[-:]/g, '')}.csv`
     link.click()
     URL.revokeObjectURL(url)
-    ElMessage.success('导出成功')
+
+    // 后端超上限时会截断，必须让用户知道拿到的不是全部数据
+    if (headers['x-export-truncated'] === 'true') {
+      const matched = Number(headers['x-export-matched'])
+      const exported = Number(headers['x-export-exported'])
+      ElMessage.warning(
+        `数据量超过导出上限，仅导出最早的 ${exported} 条（共命中 ${matched} 条），请收窄筛选条件后重试`,
+      )
+    } else {
+      ElMessage.success('导出成功')
+    }
+  } catch {
+    // 提示已由全局拦截器统一给出
   } finally {
     exporting.value = false
   }
 }
 
 onMounted(async () => {
-  tables.value = await getAuditTables()
+  try {
+    const [labelDict, tableList] = await Promise.all([getAuditLabels(), getAuditTables()])
+    ACTION_LABELS.value = labelDict.actions || ACTION_LABELS.value
+    TABLE_LABELS.value = labelDict.tables || {}
+    FIELD_LABELS.value = labelDict.fields || {}
+    tables.value = tableList
+  } catch {
+    // 字典拿不到时保留兜底值，列表仍可查看
+  }
   load()
 })
 </script>

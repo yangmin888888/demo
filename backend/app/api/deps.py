@@ -4,13 +4,22 @@ from jwt import PyJWTError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, is_token_revoked
 from app.db.session import get_db
 from app.models.user import User
 
 USER_QUERY = select(User)
 
 bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def get_current_credentials(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> HTTPAuthorizationCredentials:
+    """取出原始 Bearer 凭据，供登出等需要 token 原文的场景使用。"""
+    if credentials is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录或登录已过期")
+    return credentials
 
 
 def get_current_user(
@@ -27,6 +36,13 @@ def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="未登录或登录已过期",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    # token 签名有效不代表仍然有效：登出后 jti 会进入撤销名单
+    if is_token_revoked(db, payload.get("jti")):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="登录已失效，请重新登录",
             headers={"WWW-Authenticate": "Bearer"},
         )
     user = db.scalar(USER_QUERY.where(User.id == int(payload["sub"])))

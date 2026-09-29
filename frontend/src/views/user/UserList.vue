@@ -157,6 +157,8 @@ const load = async () => {
     const data = await getUserList({ page: page.value, size: size.value, keyword: keyword.value || undefined })
     list.value = data.items
     total.value = data.total
+  } catch {
+    // 错误提示已由全局拦截器统一给出，这里只需避免未捕获的 rejection
   } finally {
     loading.value = false
   }
@@ -178,8 +180,26 @@ const openDialog = (row) => {
   nextTick(() => formRef.value?.clearValidate())
 }
 
+/**
+ * 把后端 422 的字段级错误定位到具体表单项。
+ * Element Plus 的 FormInstance 没有 setFields 之类的公开 API，
+ * 因此这里用受支持的 scrollToField 把出错的字段滚动到可见区域，
+ * 具体文案由全局拦截器以 toast 呈现。
+ */
+const focusServerError = (errors) => {
+  const field = errors.find((e) => e.field && formRef.value)
+  if (field) {
+    formRef.value.scrollToField(field.field)
+  }
+}
+
 const onSave = async () => {
-  await formRef.value.validate()
+  try {
+    // 表单校验不通过时 validate() 也会 reject，同样需要接住
+    await formRef.value.validate()
+  } catch {
+    return
+  }
   saving.value = true
   try {
     if (form.id) {
@@ -194,20 +214,33 @@ const onSave = async () => {
     ElMessage.success('保存成功')
     dialogVisible.value = false
     load()
+  } catch (err) {
+    if (err.validationErrors?.length) {
+      focusServerError(err.validationErrors)
+    }
   } finally {
     saving.value = false
   }
 }
 
 const onDelete = async (row) => {
-  await ElMessageBox.confirm(`确定删除用户「${row.username}」吗？`, '删除确认', {
-    confirmButtonText: '删除',
-    cancelButtonText: '取消',
-    type: 'warning',
-  })
-  await deleteUser(row.id)
-  ElMessage.success('删除成功')
-  load()
+  try {
+    await ElMessageBox.confirm(`确定删除用户「${row.username}」吗？`, '删除确认', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    // 用户取消删除，ElMessageBox reject 的 'cancel' 必须吞掉
+    return
+  }
+  try {
+    await deleteUser(row.id)
+    ElMessage.success('删除成功')
+    load()
+  } catch {
+    // 提示已由全局拦截器给出
+  }
 }
 
 onMounted(load)

@@ -53,22 +53,26 @@ import { useUserStore } from '@/stores/user'
 const router = useRouter()
 const userStore = useUserStore()
 
-const menus = computed(() =>
-  router.options.routes
-    .find((r) => r.path === '/')
-    .children.filter((c) => !c.meta?.superOnly || userStore.isSuperuser),
-)
+const menus = computed(() => {
+  const root = router.options.routes.find((r) => r.path === '/')
+  return (root?.children || []).filter((c) => !c.meta?.superOnly || userStore.isSuperuser)
+})
 
 const onCommand = async (cmd) => {
-  if (cmd === 'logout') {
+  if (cmd !== 'logout') return
+  try {
     await ElMessageBox.confirm('确定退出登录吗？', '提示', {
       confirmButtonText: '退出',
       cancelButtonText: '取消',
       type: 'warning',
     })
-    userStore.logout()
-    router.push('/login')
+  } catch {
+    // 用户点了取消，ElMessageBox 会以 'cancel' 字符串 reject，必须显式吞掉
+    return
   }
+  // 通知后端把 token 加入撤销名单，使其立即失效
+  await userStore.logout()
+  router.push('/login')
 }
 </script>
 

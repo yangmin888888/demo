@@ -33,6 +33,12 @@ const routes = [
       },
     ],
   },
+  {
+    path: '/:pathMatch(.*)*',
+    name: 'NotFound',
+    component: () => import('@/views/NotFound.vue'),
+    meta: { title: '页面不存在' },
+  },
 ]
 
 const router = createRouter({
@@ -40,15 +46,21 @@ const router = createRouter({
   routes,
 })
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
+  const userStore = useUserStore()
+
+  // 刷新页面后 localStorage 里的 token 可能已失效，先确认再放行
+  if (userStore.token && !userStore.sessionChecked) {
+    await userStore.restoreSession()
+  }
+
   document.title = to.meta.title ? `${to.meta.title} - 管理后台` : '管理后台'
 
-  const userStore = useUserStore()
   if (to.meta.public) {
     if (userStore.token && to.path === '/login') return '/dashboard'
     return true
   }
-  if (!userStore.token) return '/login'
+  if (!userStore.token) return { path: '/login', query: to.fullPath === '/' ? {} : { redirect: to.fullPath } }
   if (to.meta.superOnly && !userStore.isSuperuser) return '/dashboard'
   return true
 })

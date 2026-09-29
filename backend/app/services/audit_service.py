@@ -18,7 +18,7 @@ REDACTED_FIELDS = {"hashed_password"}
 REDACTED_PLACEHOLDER = "***"
 # action 的中文描述，供前端展示
 ACTION_LABELS: dict[str, str] = {"insert": "新增", "update": "修改", "delete": "删除"}
-TABLE_LABELS: dict[str, str] = {"users": "用户"}
+TABLE_LABELS: dict[str, str] = {"users": "用户", "revoked_tokens": "令牌撤销"}
 # 字段名的中文描述，两级字典：表名 -> 字段名 -> 中文
 FIELD_LABELS: dict[str, dict[str, str]] = {
     "users": {
@@ -28,7 +28,13 @@ FIELD_LABELS: dict[str, dict[str, str]] = {
         "hashed_password": "登录密码",
         "is_active": "启用状态",
         "is_superuser": "管理员",
-    }
+    },
+    "revoked_tokens": {
+        "jti": "令牌标识",
+        "user_id": "用户ID",
+        "expires_at": "令牌过期时间",
+        "created_at": "撤销时间",
+    },
 }
 
 
@@ -68,6 +74,19 @@ def _column_data(target) -> dict:
     return data
 
 
+def _record_id(target) -> int | None:
+    """取记录主键。不能硬编码 target.id——并非所有表都有 id 列。
+
+    复合主键的表不产生 record_id（audit_logs.record_id 是单列整型，
+    塞不进复合键值），这类表的新增/修改/删除将无法按记录 ID 追溯。
+    """
+    primary_key = inspect(target).mapper.primary_key
+    if len(primary_key) != 1:
+        return None
+    value = getattr(target, primary_key[0].key, None)
+    return value if isinstance(value, int) else None
+
+
 def _emit(target, connection, operation_id: str, table: str, record_id, action: str, field: str | None, old, new) -> None:
     user_id, username = get_actor(object_session(target))
     connection.execute(
@@ -96,7 +115,7 @@ def _on_insert(mapper: Mapper, connection, target) -> None:
         connection,
         uuid.uuid4().hex,
         target.__tablename__,
-        getattr(target, "id", None),
+        _record_id(target),
         "insert",
         "*",
         None,
@@ -108,7 +127,7 @@ def _on_update(mapper: Mapper, connection, target) -> None:
     if target.__tablename__ in EXCLUDED_TABLES:
         return
     state = inspect(target)
-    record_id = getattr(target, "id", None)
+    record_id = _record_id(target)
     operation_id = uuid.uuid4().hex
     for prop in state.mapper.column_attrs:
         if prop.key in IGNORED_FIELDS:
@@ -134,7 +153,7 @@ def _on_delete(mapper: Mapper, connection, target) -> None:
         connection,
         uuid.uuid4().hex,
         target.__tablename__,
-        getattr(target, "id", None),
+        _record_id(target),
         "delete",
         "*",
         _column_data(target),

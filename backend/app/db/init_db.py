@@ -3,7 +3,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.security import hash_password
+from app.core.security import hash_password, purge_expired_revocations
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -17,11 +17,15 @@ DEFAULT_ADMIN = {
 
 
 def init_db(db: Session) -> None:
-    """初始化数据库：建表并写入种子管理员账号。"""
+    """初始化数据库：建表、清理过期的令牌撤销记录并写入种子管理员账号。"""
     from app.db.base import Base
     from app.db.session import engine
 
     Base.metadata.create_all(bind=engine)
+
+    purged = purge_expired_revocations(db)
+    if purged:
+        logger.info("已清理 %s 条过期的令牌撤销记录", purged)
 
     exists = db.scalar(select(User).where(User.username == DEFAULT_ADMIN["username"]))
     if exists:

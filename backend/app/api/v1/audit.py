@@ -13,7 +13,7 @@ from app.api import deps
 from app.models.audit import AuditLog
 from app.models.user import User
 from app.schemas.audit import AuditLogListOut
-from app.services.audit_service import ACTION_LABELS, TABLE_LABELS, field_label, serialize_json
+from app.services.audit_service import ACTION_LABELS, FIELD_LABELS, TABLE_LABELS, field_label, serialize_json
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,12 @@ def _build_query(
 @router.get("/tables", summary="可审计的表列表")
 def list_tables(_: User = Depends(deps.get_current_superuser)):
     return sorted(TABLE_LABELS.keys())
+
+
+@router.get("/labels", summary="审计字段中文名字典")
+def list_labels(_: User = Depends(deps.get_current_superuser)):
+    """供前端展示使用，避免表名/字段名的中文映射在前端硬编码一份造成不同步。"""
+    return {"actions": ACTION_LABELS, "tables": TABLE_LABELS, "fields": FIELD_LABELS}
 
 
 @router.get("", response_model=AuditLogListOut, summary="审计日志查询")
@@ -110,8 +116,12 @@ def export_audit_logs(
     csv_bytes = ("\ufeff" + buffer.getvalue()).encode("utf-8")
     filename = f"audit_logs_{datetime.now():%Y%m%d%H%M}.csv"
     quoted = urllib.parse.quote(filename)
-    return StreamingResponse(
-        iter([csv_bytes]),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quoted}"},
-    )
+    # 截断信息随响应头回传，否则前端只能看到"导出成功"，用户不知道数据不全
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+        "X-Export-Limit": str(limit),
+        "X-Export-Matched": str(matched),
+        "X-Export-Exported": str(len(rows)),
+        "X-Export-Truncated": "true" if matched > limit else "false",
+    }
+    return StreamingResponse(iter([csv_bytes]), media_type="text/csv", headers=headers)
