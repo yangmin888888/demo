@@ -1,0 +1,60 @@
+### 健康检查
+GET http://127.0.0.1:8000/
+Accept: application/json
+
+###
+
+### 登录获取 token
+POST http://127.0.0.1:8000/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "username": "admin",
+  "password": "admin123"
+}
+
+###
+
+### 当前用户（登录后替换 TOKEN）
+GET http://127.0.0.1:8000/api/v1/auth/me
+Authorization: Bearer TOKEN
+
+###
+
+### 用户列表（管理员）
+GET http://127.0.0.1:8000/api/v1/users?page=1&size=10
+Authorization: Bearer TOKEN
+
+###
+
+### 创建用户
+POST http://127.0.0.1:8000/api/v1/users
+Authorization: Bearer TOKEN
+Content-Type: application/json
+
+{
+  "username": "zhangsan",
+  "email": "zhangsan@example.com",
+  "password": "123456",
+  "nickname": "张三"
+}
+
+###
+
+### 更新用户（替换 USER_ID）
+PUT http://127.0.0.1:8000/api/v1/users/USER_ID
+Authorization: Bearer TOKEN
+Content-Type: application/json
+
+{
+  "nickname": "张三丰",
+  "is_active": true
+}
+
+###
+
+### 删除用户（替换 USER_ID）
+DELETE http://127.0.0.1:8000/api/v1/users/USER_ID
+Authorization: Bearer TOKEN
+
+###
