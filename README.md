@@ -660,6 +660,8 @@ Pinia store（`src/stores/user.js`），localStorage 持久化两个 key：
 ### 架构
 
 12. **无数据库迁移** —— 只有 `create_all`，字段变更需手工处理，建议引入 Alembic。
+
+    > **真实踩坑记录**：新增 `revoked_tokens` 时，先用 `jti` 作主键写了一版，随后改成自增 `id` + `jti` 唯一索引。开发库里 `create_all` 发现表已存在便**跳过**，旧表结构原封不动留着，于是运行时才炸出 `sqlite3.OperationalError: no such column: id`——`INSERT INTO revoked_tokens (jti, user_id, expires_at) ... RETURNING id, created_at` 打到了没有 `id` 列的表上。全新临时库的测试全部通过，正是因为那里按最终模型从零建表。**教训：改已建表的结构后必须手工 `DROP TABLE` 重建，不能指望 `create_all`；这也正是缺迁移工具的代价。**
 13. **无自动化测试** —— `test_main.http` 只是手工请求集。仓库内没有测试目录。
 14. **时间字段无时区** —— `DateTime` 未加 `timezone=True`。SQLite 的 `CURRENT_TIMESTAMP` 是 UTC，MySQL 的 `func.now()` 是服务器本地时区，**切库时存在时区语义差异**。`revoked_tokens.expires_at` 已按 UTC 无时区值存储，与项目现状一致。
 15. **`keyword` / `username` 未转义 `%` 和 `_`** —— 用户输入的通配符会被 LIKE 直接解释。
