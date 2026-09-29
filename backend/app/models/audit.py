@@ -1,9 +1,10 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Integer, JSON, String, func
+from sqlalchemy import Index, Integer, JSON, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.db.types import UTCDateTime, utcnow
 
 
 class AuditLog(Base):
@@ -25,6 +26,4 @@ class AuditLog(Base):
     field_name: Mapped[str | None] = mapped_column(String(64), comment="变更字段（update 时），insert/delete 为 *")
     old_value: Mapped[dict | list | str | int | float | None] = mapped_column(JSON, comment="修改前值")
     new_value: Mapped[dict | list | str | int | float | None] = mapped_column(JSON, comment="修改后值")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), index=True, nullable=False
-    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, index=True, nullable=False)

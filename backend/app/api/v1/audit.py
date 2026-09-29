@@ -2,7 +2,7 @@ import csv
 import io
 import logging
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api import deps
+from app.db.types import utcnow
 from app.models.audit import AuditLog
 from app.models.user import User
 from app.schemas.audit import AuditLogListOut
@@ -40,6 +41,8 @@ def _build_query(
         query = query.where(AuditLog.username.like(f"%{username}%"))
     if record_id is not None:
         query = query.where(AuditLog.record_id == record_id)
+    # 时间条件由 UTCDateTime 的 bind processor 归一到 UTC：带偏移的换算，
+    # naive 的按 UTC 解释，所以客户端传 Z、+08:00 或不带偏移都不会查错
     if start_time:
         query = query.where(AuditLog.created_at >= start_time)
     if end_time:
@@ -101,7 +104,8 @@ def export_audit_logs(
     for row in rows:
         writer.writerow(
             [
-                row.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                # 审计时间统一是 UTC，尾缀 Z 明确标注，避免被误读成本地时间
+                row.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
                 ACTION_LABELS.get(row.action, row.action),
                 TABLE_LABELS.get(row.table_name, row.table_name),
                 row.record_id or "",
@@ -114,7 +118,8 @@ def export_audit_logs(
         )
 
     csv_bytes = ("\ufeff" + buffer.getvalue()).encode("utf-8")
-    filename = f"audit_logs_{datetime.now():%Y%m%d%H%M}.csv"
+    # 文件名与内容同源，都用 UTC，避免"文件名是本地时间、内容是 UTC"的两套时间
+    filename = f"audit_logs_{utcnow():%Y%m%d%H%M}Z.csv"
     quoted = urllib.parse.quote(filename)
     # 截断信息随响应头回传，否则前端只能看到"导出成功"，用户不知道数据不全
     headers = {

@@ -1,9 +1,10 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Integer, String, func
+from sqlalchemy import Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.db.types import UTCDateTime, utcnow
 
 
 class RevokedToken(Base):
@@ -14,6 +15,8 @@ class RevokedToken(Base):
 
     expires_at 存的是 token 自身的过期时间：过期后该记录失去意义，
     由 init_db 的清理逻辑回收，避免表无限增长。
+
+    时间列统一用 UTCDateTime：写库存 UTC 墙钟时间，读出来带 UTC 时区。
     """
 
     __tablename__ = "revoked_tokens"
@@ -26,7 +29,7 @@ class RevokedToken(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     jti: Mapped[str] = mapped_column(String(64), nullable=False, comment="token 的 jti 声明")
     user_id: Mapped[int | None] = mapped_column(comment="被撤销 token 所属用户")
-    expires_at: Mapped[datetime] = mapped_column(DateTime, comment="token 自身过期时间")
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime, comment="token 自身过期时间（UTC）")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False, comment="撤销时间"
+        UTCDateTime, default=utcnow, nullable=False, comment="撤销时间（UTC）"
     )

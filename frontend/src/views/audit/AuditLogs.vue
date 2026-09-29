@@ -33,7 +33,7 @@
 
     <el-table v-loading="loading" :data="list" border stripe>
       <el-table-column prop="created_at" label="时间" width="165">
-        <template #default="{ row }">{{ row.created_at?.replace('T', ' ') }}</template>
+        <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
       </el-table-column>
       <el-table-column label="操作" width="80" align="center">
         <template #default="{ row }">
@@ -89,6 +89,7 @@ import { ref, reactive, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Search, Refresh, Download } from '@element-plus/icons-vue'
 import { getAuditTables, getAuditLogs, getAuditLabels, exportAuditLogs } from '@/api/audit'
+import { formatDateTime } from '@/utils/datetime'
 
 // 兜底字典：接口未返回前先用英文原文占位，避免模板访问 undefined
 const ACTION_LABELS = ref({ insert: '新增', update: '修改', delete: '删除' })

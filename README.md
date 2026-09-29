@@ -20,6 +20,7 @@
 - [数据库设计](#数据库设计)
 - [核心机制](#核心机制)
 - [认证与登出](#认证与登出)
+- [时间与时区](#时间与时区)
 - [前端实现要点](#前端实现要点)
 - [前端错误处理](#前端错误处理)
 - [已知问题与技术债](#已知问题与技术债)
@@ -142,6 +143,7 @@ demo/
 │   │   │   └── audit_context.py  # 操作人上下文
 │   │   ├── db/
 │   │   │   ├── base.py          # DeclarativeBase
+│   │   │   ├── types.py         # UTCDateTime / utcnow：时间列统一以 UTC 存取
 │   │   │   ├── session.py       # engine / SessionLocal / get_db
 │   │   │   └── init_db.py       # 建表 + 清理过期撤销 + 种子管理员
 │   │   ├── models/              # SQLAlchemy ORM 模型
@@ -180,6 +182,7 @@ demo/
         ├── stores/user.js      # Pinia：登录态、会话恢复、登出
         ├── utils/request.js    # axios 实例 + 拦截器（401/403/422/blob headers）
         ├── utils/token.js      # 客户端 JWT 解析与过期判断
+        ├── utils/datetime.js   # UTC 时间串 -> 本地时间显示
         ├── styles/index.css     # 全局 reset
         └── views/
             ├── Login.vue
@@ -431,8 +434,8 @@ CSV 表头：`时间, 操作类型, 表, 记录ID, 操作人, 修改字段, 修�
 | `hashed_password` | String(128) | not null | — | bcrypt 哈希（实际 60 字符） |
 | `is_active` | Boolean | not null | `true` | 是否启用 |
 | `is_superuser` | Boolean | not null | `false` | 是否管理员 |
-| `created_at` | DateTime | not null | `server_default=now()` | |
-| `updated_at` | DateTime | not null | `server_default=now()`, `onupdate=now()` | |
+| `created_at` | DateTime | not null | `default=utcnow` | |
+| `updated_at` | DateTime | not null | `default=utcnow`, `onupdate=utcnow` | |
 
 ### `audit_logs` 审计表
 
@@ -448,7 +451,7 @@ CSV 表头：`时间, 操作类型, 表, 记录ID, 操作人, 修改字段, 修�
 | `field_name` | String(64) | nullable | 变更字段名；`insert`/`delete` 固定为 `"*"` |
 | `old_value` | JSON | nullable | 修改前值 |
 | `new_value` | JSON | nullable | 修改后值 |
-| `created_at` | DateTime | not null, index | |
+| `created_at` | DateTime | not null, index, `default=utcnow` | |
 
 复合索引 `ix_audit_table_record(table_name, record_id)` 支撑「按表 + 记录查审计轨迹」。
 
@@ -461,8 +464,8 @@ CSV 表头：`时间, 操作类型, 表, 记录ID, 操作人, 修改字段, 修�
 | `id` | Integer | PK, autoincrement | |
 | `jti` | String(64) | not null, unique index | token 的 `jti` 声明 |
 | `user_id` | Integer | nullable | token 所属用户 |
-| `expires_at` | DateTime | not null, index | token 自身的过期时间（UTC 无时区） |
-| `created_at` | DateTime | not null, `server_default=now()` | 撤销时间 |
+| `expires_at` | DateTime | not null, index | token 自身的过期时间（UTC） |
+| `created_at` | DateTime | not null, `default=utcnow` | 撤销时间（UTC） |
 
 JWT 无状态，服务端无法"删除"已签发的 token。登出时把 `jti` 登记到此表，鉴权时拒绝命中记录。`init_db()` 每次启动清理 `expires_at` 已过期的行（那些 token 本就已自然失效，记录没有意义）。
 
@@ -663,13 +666,44 @@ Pinia store（`src/stores/user.js`），localStorage 持久化两个 key：
 
     > **真实踩坑记录**：新增 `revoked_tokens` 时，先用 `jti` 作主键写了一版，随后改成自增 `id` + `jti` 唯一索引。开发库里 `create_all` 发现表已存在便**跳过**，旧表结构原封不动留着，于是运行时才炸出 `sqlite3.OperationalError: no such column: id`——`INSERT INTO revoked_tokens (jti, user_id, expires_at) ... RETURNING id, created_at` 打到了没有 `id` 列的表上。全新临时库的测试全部通过，正是因为那里按最终模型从零建表。**教训：改已建表的结构后必须手工 `DROP TABLE` 重建，不能指望 `create_all`；这也正是缺迁移工具的代价。**
 13. **无自动化测试** —— `test_main.http` 只是手工请求集。仓库内没有测试目录。
-14. **时间字段无时区** —— `DateTime` 未加 `timezone=True`。SQLite 的 `CURRENT_TIMESTAMP` 是 UTC，MySQL 的 `func.now()` 是服务器本地时区，**切库时存在时区语义差异**。`revoked_tokens.expires_at` 已按 UTC 无时区值存储，与项目现状一致。
+14. **~~时间字段无时区~~** —— **已修复**。所有时间列统一存 UTC、读出带 UTC 时区，见下方「[时间与时区](#时间与时区)」。
 15. **`keyword` / `username` 未转义 `%` 和 `_`** —— 用户输入的通配符会被 LIKE 直接解释。
 16. **`start.ps1` 不检测 `package.json` 变更** —— `node_modules` 存在就跳过 `npm install`，改依赖后需手动重装。
 17. **新增 ORM 模型不会被审计** —— `install_audit_listeners()` 在模块导入期遍历 `Base.registry.mappers`，新模型文件若未被任何路由导入，就不会注册审计事件。详见下方「待办方案」。
 18. **审计表只读靠约定** —— 没有数据库级约束阻止直接改表。
 19. **复合主键的表无法按记录 ID 追溯** —— `audit_logs.record_id` 是单列整型，`_record_id()` 对复合主键返回 `None`。当前无此类表。
 20. **撤销名单与 JWT 无状态属性冲突** —— 撤销记录存在数据库，因此服务重启不影响；但多实例部署需要共享数据库才能一致生效。
+
+---
+
+## 时间与时区
+
+**所有时间列统一存 UTC 墙钟时间，读出来带 UTC 时区。** 实现集中在 `app/db/types.py` 的 `UTCDateTime`：
+
+| 环节 | 行为 |
+| --- | --- |
+| 写入 | naive 值按 UTC 解释；带偏移的值先折算成 UTC；然后**剥掉 tzinfo** 再落库 |
+| 读出 | 一律补上 `timezone.utc`，应用层拿到的永远是 aware 的 UTC |
+| 默认值 | Python 侧 `default=utcnow` / `onupdate=utcnow`，**不再用 `server_default=func.now()`** |
+
+三个决定值得说明：
+
+1. **为什么没加 `timezone=True`。** SQLite 和 MySQL 的 `DATETIME` 都不带时区信息，写进去的偏移量会被直接丢弃，`timezone=True` 对这两者毫无作用（只有 PostgreSQL 的 `TIMESTAMPTZ` 才真正受益）。光加这个参数解决不了问题。
+2. **为什么不用 `func.now()` 当默认值。** SQLite 的 `CURRENT_TIMESTAMP` 是 UTC，MySQL 的 `now()` 是服务器本地时区——同一句 SQL 换个库就是另一个时刻。改由 Python 写入后，任何方言下都是 UTC。
+3. **为什么落库时要剥掉 tzinfo。** 库里的存量数据和历史导出文件都是无偏移格式，保持一致就不需要迁移、不需要重建表（参见技术债 12 的踩坑记录）。
+
+由此带来的行为变化：
+
+- JSON 响应里的时间串变成 `"2026-09-29T05:24:17.857446Z"`（Pydantic 对 UTC 用 `Z` 表示），此前是无偏移的 `"2026-09-29T05:24:17.857446"`。
+- 前端新增 `utils/datetime.js` 的 `formatDateTime()`，按**浏览器本地时区**渲染，`Dashboard.vue` 与 `AuditLogs.vue` 改用它。
+  - 坑：`localStorage` 里还可能存着旧的无偏移串，而 `new Date()` 对无偏移串按**本地时间**解释，会整整差一个时区偏移。`formatDateTime()` 识别这类串并补 `Z`。
+- CSV 导出的时间列加 `Z` 后缀（`2026-09-29 05:24:17Z`），文件名改为 `audit_logs_202609290524Z.csv`——此前文件名用**本地时间**而内容是 UTC，两套时间对不上。
+
+**仍然存在的限制**：
+
+- **时区转换只发生在展示层。** 查询参数 `start_time` / `end_time` 会被 bind processor 归一到 UTC（传 `Z`、`+08:00` 或不带偏移都能正确命中），但界面上的时间筛选控件仍是本地时间，界面上没有时区提示。
+- **数据库层面依然没有时区类型，约束靠约定。** 若有人绕过 ORM 直接 `INSERT` 一个本地时间值，应用层会把它当 UTC 读，误差不会被发现。MySQL 建议把列声明为 `TIMESTAMP`（MySQL 会自己做时区转换）或在列上加 `CHECK`。
+- 旧的存量数据本来也是 UTC（SQLite 写入的），**无需回填**。
 
 ---
 
@@ -738,17 +772,24 @@ JWT 本身无状态，服务端无法"删除"一个已签发的 token。本项�
 | `init_db` 日志打印明文密码 | 改为只打印用户名并提示尽快改密 |
 | insert 审计记录 `record_id` 恒为 null | 事件从 `before_insert` 改挂 `after_insert`，主键回填后可正常记录 |
 | 健壮性 1-11 项 | 见上方「已知问题与技术债」逐条说明 |
+| 架构技术债 14：时间字段无时区 | 新增 `app/db/types.py` 的 `UTCDateTime` 与 `utcnow()`，四个时间列统一以 UTC 存取；默认值改 Python 侧写入，摆脱方言差异；前端新增 `formatDateTime()` 按本地时区显示。详见「[时间与时区](#时间与时区)」 |
 
 补充修复（修复过程中发现）：
 
 - `_record_id()` 原本硬编码 `getattr(target, "id")`。新增 `revoked_tokens` 表时暴露出该假设的脆弱性（当时一度想以 `jti` 作主键），改为按 mapper 的主键通用提取；该表最终仍保留自增 `id` 作主键、`jti` 作唯一索引，与项目其余表保持一致。
 - `AuditLogs.vue` 的 `fmtValue()` 原本用**筛选条件**的表名去查字段字典，未筛选时必然查不到。改为取行自身的 `table_name`。
+- CSV 导出的**文件名**此前用 `datetime.now()`（本地时间）而**内容**是 UTC，同一个文件里两套时间。统一成 `utcnow()` 并加 `Z` 后缀。
 
 验证方式：
 
 - 后端断言 82 项（TestClient：建号 / 改密 / 删除 / 权限 / CSV 内容 / 导出上限 / 全表哈希泄漏 / 主键回填 / 事务回滚 / 令牌撤销 / 字典接口 / 响应头 / 回填脚本）
 - 端到端 27 项（真实 uvicorn + HTTP 客户端跑通登录、造数、导出截断、登出失效、422 载荷结构）
 - 前端断言 78 项（对真实源码 Vite 打包后，用本地 HTTP 服务代替后端跑 `request.js` 拦截器、422 解析、403 判定、JWT 解析、Pinia store 会话恢复、路由守卫判定）
+- 时区专项 72 项：
+  - 类型语义 26 项（落库为 UTC 墙钟时间 / 读出 aware / `+08:00` 折算 / naive 视为 UTC / `onupdate` 生效 / Core insert 的默认值 / 撤销与清理 / 存量 naive 行照读 / 筛选参数归一）
+  - 端到端 18 项（真实 uvicorn 跑通 `/auth/me` 时间格式、建号与审计时间、区间筛选含 `+08:00` 参数、CSV 的 `Z` 标注、改密、登出）
+  - 前端 17 项（`formatDateTime` 的本地时区渲染、旧缓存 naive 串、非法值回退）
+  - 存量库兼容 11 项（复制真实 `admin.db`，确认旧数据按 UTC 读出且新写入不破坏历史）
 
 ---
 

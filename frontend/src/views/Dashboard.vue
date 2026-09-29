@@ -12,7 +12,7 @@
           </el-tag>
         </el-descriptions-item>
         <el-descriptions-item label="创建时间">
-          {{ userStore.userInfo?.created_at?.replace('T', ' ') }}
+          {{ formatDateTime(userStore.userInfo?.created_at) }}
         </el-descriptions-item>
       </el-descriptions>
     </el-card>
@@ -21,6 +21,7 @@
 
 <script setup>
 import { useUserStore } from '@/stores/user'
+import { formatDateTime } from '@/utils/datetime'
 
 const userStore = useUserStore()
 </script>
