@@ -331,7 +331,7 @@ DATABASE_URL=mysql+pymysql://root:password@127.0.0.1:3306/admin?charset=utf8mb4
 
 ### 审计日志
 
-以下 3 个接口只要求「已登录」，**普通用户也能查询和导出全部审计日志**。如果需要收紧权限，把 `deps.get_current_user` 换成 `deps.get_current_superuser` 即可。
+以下 3 个接口要求**超级管理员**（与前端路由 `superOnly` 一致），普通用户一律 `403`。
 
 #### `GET /api/v1/audit-logs`
 
@@ -354,11 +354,17 @@ DATABASE_URL=mysql+pymysql://root:password@127.0.0.1:3306/admin?charset=utf8mb4
 
 #### `GET /api/v1/audit-logs/export`
 
-接受与查询接口完全相同的过滤条件，返回 `text/csv` 流。**不分页**（全量加载）。
+接受与查询接口完全相同的过滤条件，返回 `text/csv` 流。
+
+| 参数 | 类型 | 默认 | 约束 | 说明 |
+| --- | --- | --- | --- | --- |
+| `limit` | int | 50000 | `1 ~ 50000` | 单次导出行数上限（`EXPORT_MAX_ROWS`） |
+
+超出上限时导出**最早的** `limit` 条，服务端打 `WARNING` 日志记录被截断的行数，避免全量加载导致 OOM。需要导出更多数据时请收窄筛选条件或分批导出。
 
 CSV 表头：`时间, 操作类型, 表, 记录ID, 操作人, 修改字段, 修改前, 修改后, 操作ID`
 
-实现细节：内容前置 UTF-8 BOM（`\ufeff`）确保 Excel 正确识别中文；`Content-Disposition` 用 RFC 5987 的 `filename*=UTF-8''` 传递文件名；JSON 值序列化时换行替换为空格以免破坏 CSV 结构。
+实现细节：内容前置 UTF-8 BOM（`\ufeff`）确保 Excel 正确识别中文；`Content-Disposition` 用 RFC 5987 的 `filename*=UTF-8''` 传递文件名；「修改字段」列经 `FIELD_LABELS` 翻译为中文；JSON 值序列化时换行替换为空格以免破坏 CSV 结构；敏感字段输出 `***`。
 
 ### 手工测试
 
@@ -455,15 +461,18 @@ install_audit_listeners()   # 为 Base.registry.mappers 中每个模型注册三
 
 - `operation_id` 一次 update 内复用，可据此把多字段变更聚合成一次操作。
 - `IGNORED_FIELDS = {"id", "created_at", "updated_at"}` 排除元数据噪音。
+- `REDACTED_FIELDS = {"hashed_password"}` 敏感字段脱敏，值记为 `***`，但**保留该条变更记录**（能看出「谁在何时改过密码」，但看不到哈希本身）。对 insert / delete 的整行快照同样生效。
 - `EXCLUDED_TABLES = {"audit_logs"}` 审计表自身不参与审计（否则会无限递归）。
 - 写入用 `connection.execute(AuditLog.__table__.insert()...)` 走**同一条连接的原始 SQL**，不经过 ORM，因此不会再次触发事件。
 - 序列化：datetime/date → ISO 8601；bytes → decode；Base 实例 → str；其余原样。
+
+`FIELD_LABELS` 是两级字典（表名 → 字段名 → 中文），后端通过 `field_label()` 翻译，CSV 导出用；页面上用的是 `AuditLogs.vue` 里另一份硬编码副本，**两处需同步维护**。
 
 **操作人如何传递**（`app/core/audit_context.py`）：把 `(user_id, username)` 绑定到 `Session.info`，而不是用 `contextvars` —— 因为 FastAPI 的同步依赖和同步路由函数运行在线程池的不同线程，`ContextVar` 不跨线程传播。可行的前提是 `get_current_user` 与路由函数依赖的是**同一个** `get_db` 生成器，FastAPI 的依赖缓存保证只 yield 一次，因此拿到同一个 Session 实例。
 
 **审计表只读**是约定而非数据库强制：模型注释声称「数据库层面禁止一切对该表的写操作」，但代码中并没有注册 `before_update` / `before_delete` 监听器去阻止写，只是**不提供**任何修改/删除接口。直接操作数据库仍可篡改审计记录。
 
-> ⚠️ 改密码会写入一条 `field_name="hashed_password"` 的审计记录，**记录的是 bcrypt 哈希原文**。
+> ⚠️ `before_insert` 触发时 SQLAlchemy 尚未回填自增主键，因此 **insert 类审计记录的 `record_id` 恒为 `null`**，无法用「记录ID」筛出某条记录的创建轨迹（update / delete 不受影响）。修复需把事件改挂到 `after_insert` 并从 `context.inserted_primary_key` 取主键。
 
 ### Session 管理
 
@@ -505,7 +514,9 @@ install_audit_listeners()   # 为 Base.registry.mappers 中每个模型注册三
 
 - axios 实例：`baseURL: '/api/v1'`、`timeout: 15000`。
 - 请求拦截器：从 `localStorage.getItem('token')` 读取，注入 `Authorization: Bearer <token>`。
-- 响应拦截器：直接返回 `response.data`（业务代码无需 `.data`）；`401` 时清除 `token` / `userInfo` 并 `location.href = '/login'` 整页跳转；其余错误用 `ElMessage` 弹出后端 `detail`。
+- 响应拦截器：直接返回 `response.data`（业务代码无需 `.data`）；`401` 时清除 `token` / `userInfo` 并调用注入的处理器；其余错误用 `ElMessage` 弹出后端 `detail`。
+- `setUnauthorizedHandler()`：401 后的登出与跳转逻辑由 `main.js` 注入。`request.js` **不直接 import router / store**，否则会形成 `store → api → request` 的循环依赖。
+- 处理器会调用 `userStore.logout()` 同步清空 **Pinia 内存状态**，再 `router.push` 到 `/login`。这一步是必需的：若只清 localStorage，路由守卫 `router/index.js:48` 会因残留的 `userStore.token` 把用户从 `/login` 又弹回 `/dashboard`，形成死循环。
 - Vite 代理把 `/api` 转发到后端，因此**开发环境无跨域问题**；后端 CORS 白名单仍配置了 `localhost:5173` 与 `127.0.0.1:5173`。
 
 ### 登录态
@@ -546,32 +557,47 @@ Pinia store（`src/stores/user.js`），localStorage 持久化两个 key：
 
 ### 需要修复
 
-1. **CSV 导出的「修改字段」列翻译错误** —— `app/api/v1/audit.py:93` 误用了 `TABLE_LABELS`（表名映射 `{"users": "用户"}`）来翻译字段名，应为独立的 `FIELD_LABELS`。结果：导出的 CSV 中「修改字段」列恒为原始英文字段名（如 `nickname`），中文翻译只在页面上生效。
-2. **审计日志权限过宽** —— 任意普通用户都能查询和导出全部审计日志（含其他用户的操作记录）。收紧方式：把 `audit.py` 中的 `deps.get_current_user` 换成 `deps.get_current_superuser`。
-3. **导出接口无分页** —— `audit.py:80` 全量 `.all()` 后在内存中生成 CSV，数据量大时有 OOM 风险。建议加最大条数限制或改用流式游标。
-4. **401 处理是整页跳转** —— `request.js:25` 用 `location.href` 而非 `router.push`，会丢失 SPA 状态并重新加载整个 bundle。同一处也只清了 localStorage，没清 Pinia state。
-5. **改密码会记录密码哈希到审计表** —— 建议把 `hashed_password` 加入 `audit_service.IGNORED_FIELDS`，或实现脱敏（如 `***`）。
-6. **`init_db.py:40` 把明文密码打进日志** —— 生产环境应删除或脱敏。
+1. **insert 类审计记录丢失 `record_id`** —— `audit_service._on_insert` 挂在 `before_insert`，此时 SQLAlchemy 尚未回填自增主键，`getattr(target, "id", None)` 恒为 `None`，导致**所有 insert 审计记录的 `record_id` 都是 `null`**。影响：无法用「记录ID」筛出某条记录的创建轨迹，复合索引 `ix_audit_table_record` 对 insert 场景失效。修复方式：把事件改挂到 `after_insert`，从 `context.inserted_primary_key` 取主键。update / delete 不受影响。
 
 ### 健壮性
 
-7. **无 404 兜底路由** —— 访问未知路径白屏。
-8. **FastAPI 422 校验错误被压成「请求失败」** —— 422 的 `detail` 是数组而非字符串，`request.js:28` 的三元判断走不进去，字段级校验信息全部丢失。应改用 `el-form` 的服务端错误回填或解析数组首条。
-9. **只处理 401，不处理 403** —— 权限不足时用户看不到任何引导。
-10. **页面只有 `try/finally` 没有 `catch`** —— 依赖全局拦截器提示，但会产生未捕获的 Promise rejection。
-11. **`ElMessageBox.confirm` 取消产生的 rejection 未捕获** —— `AdminLayout.vue:64`、`UserList.vue:203` 会打控制台警告。
-12. **`router.options.routes.find(...).children` 未用可选链** —— `AdminLayout.vue:58-59`，路由结构调整时会崩。
-13. **登录态刷新后不校验 token 有效性** —— 直接读 localStorage，过期 token 会显示陈旧用户信息直到下一次 API 调用。
-14. **登出不通知后端** —— 没有 token 失效机制，JWT 在过期前始终有效。
+2. **无 404 兜底路由** —— 访问未知路径白屏。
+3. **FastAPI 422 校验错误被压成「请求失败」** —— 422 的 `detail` 是数组而非字符串，`request.js` 的三元判断走不进去，字段级校验信息全部丢失。应解析数组首条并回填到 `el-form`。
+4. **只处理 401，不处理 403** —— 权限不足时用户只看到一句 toast，没有引导。
+5. **导出被截断时前端无感知** —— 后端超 `limit` 会截断并打 WARNING，但响应头不含「已截断」标记，前端照常提示「导出成功」。可在响应头加 `X-Export-Truncated` 让前端提示用户收窄条件。
+6. **页面只有 `try/finally` 没有 `catch`** —— 依赖全局拦截器提示，但会产生未捕获的 Promise rejection。
+7. **`ElMessageBox.confirm` 取消产生的 rejection 未捕获** —— `AdminLayout.vue`、`UserList.vue` 会打控制台警告。
+8. **`router.options.routes.find(...).children` 未用可选链** —— `AdminLayout.vue`，路由结构调整时会崩。
+9. **登录态刷新后不校验 token 有效性** —— 直接读 localStorage，过期 token 会显示陈旧用户信息直到下一次 API 调用。
+10. **登出不通知后端** —— 没有 token 失效机制，JWT 在过期前始终有效。
+11. **`FIELD_LABELS` 双份维护** —— 后端 `audit_service.py` 与前端 `AuditLogs.vue` 各有一份字段名中文映射，改一处忘另一处就会出现页面与 CSV 不一致。建议由后端提供字典接口供前端拉取。
 
 ### 架构
 
-15. **无数据库迁移** —— 只有 `create_all`，字段变更需手工处理，建议引入 Alembic。
-16. **无自动化测试** —— `test_main.http` 只是手工请求集。
-17. **时间字段无时区** —— `DateTime` 未加 `timezone=True`。SQLite 的 `CURRENT_TIMESTAMP` 是 UTC，MySQL 的 `func.now()` 是服务器本地时区，**切库时存在时区语义差异**。
-18. **`keyword` 未转义 `%` 和 `_`** —— 用户输入的通配符会被 LIKE 直接解释。
-19. **`start.ps1` 不检测 `package.json` 变更** —— `node_modules` 存在就跳过 `npm install`，改依赖后需手动重装。
-20. **新增 ORM 模型不会被审计** —— `install_audit_listeners()` 在模块导入期遍历 `Base.registry.mappers`，新模型文件若未被任何路由导入，就不会注册审计事件。
+12. **无数据库迁移** —— 只有 `create_all`，字段变更需手工处理，建议引入 Alembic。
+13. **无自动化测试** —— `test_main.http` 只是手工请求集。仓库内没有测试目录。
+14. **时间字段无时区** —— `DateTime` 未加 `timezone=True`。SQLite 的 `CURRENT_TIMESTAMP` 是 UTC，MySQL 的 `func.now()` 是服务器本地时区，**切库时存在时区语义差异**。
+15. **`keyword` / `username` 未转义 `%` 和 `_`** —— 用户输入的通配符会被 LIKE 直接解释。
+16. **`start.ps1` 不检测 `package.json` 变更** —— `node_modules` 存在就跳过 `npm install`，改依赖后需手动重装。
+17. **新增 ORM 模型不会被审计** —— `install_audit_listeners()` 在模块导入期遍历 `Base.registry.mappers`，新模型文件若未被任何路由导入，就不会注册审计事件。
+18. **审计表只读靠约定** —— 没有数据库级约束阻止直接改表。
+
+---
+
+## 本次修复记录
+
+已修复并验证的问题（提交见 git 历史）：
+
+| 问题 | 修复 |
+| --- | --- |
+| CSV「修改字段」列恒为英文 | `audit_service` 新增 `FIELD_LABELS` 与 `field_label()`，`audit.py` 改用它 |
+| 审计日志权限过宽 | `audit.py` 三个接口的 `get_current_user` 全部换成 `get_current_superuser` |
+| 导出无上限有 OOM 风险 | 新增 `limit` 参数（默认 50000，上限 50000），超限时截断并打 WARNING |
+| 401 整页跳转 + 丢失 Pinia 状态 | `request.js` 改为 `setUnauthorizedHandler()` 注入模式，`main.js` 调 `logout()` 后 `router.push` |
+| 改密码把 bcrypt 哈希写进审计表 | 新增 `REDACTED_FIELDS` / `REDACTED_PLACEHOLDER`，insert / update / delete 三条路径均脱敏为 `***` |
+| `init_db` 日志打印明文密码 | 改为只打印用户名并提示尽快改密 |
+
+验证方式：后端 30 项断言（`TestClient` 跑通建号 / 改密 / 删除 / 权限 / CSV 内容 / 上限 / 全表哈希泄漏扫描），前端 20 项断言（对真实源码打包后跑 `request.js` 拦截器与 Pinia store 行为）。
 
 ---
 
@@ -583,8 +609,6 @@ Pinia store（`src/stores/user.js`），localStorage 持久化两个 key：
 - [ ] 替换 `.env` 中的 `SECRET_KEY` 为随机长字符串
 - [ ] 切换 `DATABASE_URL` 到 MySQL（`uv add pymysql`）
 - [ ] `DEBUG=false`
-- [ ] 收紧审计日志接口权限（见技术债 #2）
-- [ ] 移除 `init_db.py` 中的明文密码日志（#6）
 
 ### 后端
 

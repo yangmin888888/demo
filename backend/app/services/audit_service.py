@@ -13,9 +13,30 @@ from app.models.audit import AuditLog
 EXCLUDED_TABLES = {"audit_logs"}
 # 系统维护的元数据字段不产生审计噪音
 IGNORED_FIELDS = {"id", "created_at", "updated_at"}
+# 敏感字段只记录"发生过变更"，不记录具体值，避免密码哈希进入审计表
+REDACTED_FIELDS = {"hashed_password"}
+REDACTED_PLACEHOLDER = "***"
 # action 的中文描述，供前端展示
 ACTION_LABELS: dict[str, str] = {"insert": "新增", "update": "修改", "delete": "删除"}
 TABLE_LABELS: dict[str, str] = {"users": "用户"}
+# 字段名的中文描述，两级字典：表名 -> 字段名 -> 中文
+FIELD_LABELS: dict[str, dict[str, str]] = {
+    "users": {
+        "username": "用户名",
+        "email": "邮箱",
+        "nickname": "昵称",
+        "hashed_password": "登录密码",
+        "is_active": "启用状态",
+        "is_superuser": "管理员",
+    }
+}
+
+
+def field_label(table_name: str | None, field_name: str | None) -> str:
+    """把 (表名, 字段名) 翻译为中文，未登记的原样返回。"""
+    if not field_name:
+        return ""
+    return FIELD_LABELS.get(table_name or "", {}).get(field_name, field_name)
 
 
 def _serialize(value):
@@ -33,6 +54,9 @@ def _column_data(target) -> dict:
     data = {}
     for prop in state.mapper.column_attrs:
         if prop.key in IGNORED_FIELDS:
+            continue
+        if prop.key in REDACTED_FIELDS:
+            data[prop.key] = REDACTED_PLACEHOLDER
             continue
         try:
             value = getattr(target, prop.key)
@@ -94,6 +118,8 @@ def _on_update(mapper: Mapper, connection, target) -> None:
         new = _serialize(history.added[0]) if history.added else None
         if old == new:
             continue
+        if prop.key in REDACTED_FIELDS:
+            old = new = REDACTED_PLACEHOLDER
         _emit(target, connection, operation_id, target.__tablename__, record_id, "update", prop.key, old, new)
 
 

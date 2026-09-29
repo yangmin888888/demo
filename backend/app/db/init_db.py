@@ -37,4 +37,4 @@ def init_db(db: Session) -> None:
         )
     )
     db.commit()
-    logger.info("已创建默认管理员: %s / %s", DEFAULT_ADMIN["username"], DEFAULT_ADMIN["password"])
+    logger.info("已创建默认管理员账号 %s，请立即登录并修改初始密码", DEFAULT_ADMIN["username"])
